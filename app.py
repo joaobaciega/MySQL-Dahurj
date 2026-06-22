@@ -664,7 +664,7 @@ def pagina_relatorio_semanal():
     linhas = []
     for i, (_, r) in enumerate(g.iterrows(), 1):
         linhas.append({
-            "Seq": i, "Gerente": r["gerente"], "Marca": r["marca"], "Loja": r["loja"],
+            "Seq": str(i), "Gerente": r["gerente"], "Marca": r["marca"], "Loja": r["loja"],
             "Passagens": fmt_int(r["passagens"]), "Refil Diant.": fmt_int(r["refil_diant"]),
             "% Aprov (D)": fmt_pct(r["aprov_d"]), "Total Diant.": fmt_money(r["total_diant"]),
             "Refil Tras.": fmt_int(r["refil_tras"]), "% Aprov (T)": fmt_pct(r["aprov_t"]),
