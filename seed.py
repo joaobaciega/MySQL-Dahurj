@@ -64,7 +64,7 @@ GERENTES = {
     ("Fiat",   "Nações Unidadas"): "Adriano",
     ("Jeep",   "Vila Guilherme"): "Erasmo",
     ("Fiat",   "Osasco"):         "Arthur",
-    ("Jeep",   "Aricanduva"):     "Larissa",
+    ("Jeep",   "Aricanduva"):     "Diego",
     ("Fiat",   "Aricanduva"):     "José Elias",
 }
 
@@ -136,31 +136,58 @@ def seed(df, engine):
         uni_ids = {(r["marca"], r["loja"]): r["id"]
                    for r in conn.execute(text("SELECT id, marca, loja FROM unidades")).mappings()}
 
-        # 3) consultores ------------------------------------------------------
-        cons = df[["Consultor", "Marca", "Loja"]].drop_duplicates().copy()
-        cons["unidade_id"] = [uni_ids[(m, l)] for m, l in zip(cons["Marca"], cons["Loja"])]
+        # 3) consultores (a PESSOA — identidade só pelo nome) -----------------
+        nomes = df[["Consultor"]].drop_duplicates().copy()
         conn.execute(text("""
-            INSERT INTO consultores (nome, unidade_id)
-            VALUES (:Consultor, :unidade_id)
+            INSERT INTO consultores (nome)
+            VALUES (:Consultor)
             ON DUPLICATE KEY UPDATE nome = VALUES(nome)
-        """), cons[["Consultor", "unidade_id"]].to_dict("records"))
+        """), nomes.to_dict("records"))
 
-        cons_ids = {(r["nome"], r["unidade_id"]): r["id"]
-                    for r in conn.execute(text("SELECT id, nome, unidade_id FROM consultores")).mappings()}
+        cons_ids = {r["nome"]: r["id"]
+                    for r in conn.execute(text("SELECT id, nome FROM consultores")).mappings()}
+
+        # 3b) consultor_unidade (vínculo com vigência, reconstruído do histórico)
+        #     Para cada par (consultor, unidade) presente na base, a vigência vai
+        #     do 1º ao último mês com registro naquele par. O vínculo de MAIOR
+        #     último mês por consultor fica com fim = NULL (lotação atual), para
+        #     que novos lançamentos caiam na unidade correta.
+        vinc = (df.groupby(["Consultor", "Marca", "Loja"])["Mes"]
+                  .agg(["min", "max"]).reset_index())
+        idx_atual = set(vinc.groupby("Consultor")["max"].idxmax())
+        vinc_recs = []
+        for i, r in vinc.iterrows():
+            vinc_recs.append({
+                "consultor_id": cons_ids[r["Consultor"]],
+                "unidade_id":   uni_ids[(r["Marca"], r["Loja"])],
+                "inicio":       r["min"],
+                "fim":          None if i in idx_atual else r["max"],
+            })
+        conn.execute(text("""
+            INSERT INTO consultor_unidade
+                (consultor_id, unidade_id, vigencia_inicio, vigencia_fim)
+            VALUES (:consultor_id, :unidade_id, :inicio, :fim)
+            ON DUPLICATE KEY UPDATE vigencia_fim = VALUES(vigencia_fim)
+        """), vinc_recs)
 
        # 4) lancamentos ------------------------------------------------------
+        #    A unidade é gravada em CADA lançamento (unidade_id), vinda do par
+        #    (Marca, Loja) da linha. Assim o mesmo consultor pode ter, no mesmo
+        #    mês, lançamentos em unidades diferentes (transferência no meio do mês).
         recs = []
         for _, r in df.iterrows():
+            cid = cons_ids[r["Consultor"]]
             uid = uni_ids[(r["Marca"], r["Loja"])]
-            cid = cons_ids[(r["Consultor"], uid)]
             passagens = None if pd.isna(r["Passagens"]) else int(r["Passagens"])
             recs.append({
-                "consultor_id": cid, "mes": r["Mes"], "passagens": passagens,
+                "consultor_id": cid, "unidade_id": uid, "mes": r["Mes"],
+                "passagens": passagens,
                 "refil_diant": int(r["RD"]), "refil_tras": int(r["RT"]),
             })
         conn.execute(text("""
-            INSERT INTO lancamentos (consultor_id, mes, passagens, refil_diant, refil_tras)
-            VALUES (:consultor_id, :mes, :passagens, :refil_diant, :refil_tras)
+            INSERT INTO lancamentos
+                (consultor_id, unidade_id, mes, passagens, refil_diant, refil_tras)
+            VALUES (:consultor_id, :unidade_id, :mes, :passagens, :refil_diant, :refil_tras)
             ON DUPLICATE KEY UPDATE
               passagens   = VALUES(passagens),
               refil_diant = VALUES(refil_diant),

@@ -1,0 +1,14 @@
+# Tema Dahruj — identidade visual PRETO / LARANJA / BRANCO (proporção 60/30/10).
+# Preto domina o fundo (60%), laranja é a cor de marca/acento forte (30%) e o
+# branco fica no texto (10%). A paleta dos gráficos acompanha (ver PALETTE no app.py).
+[theme]
+base = "dark"
+primaryColor = "#EB5E33"
+backgroundColor = "#0D0D0D"
+secondaryBackgroundColor = "#1A1A1A"
+textColor = "#F5F5F5"
+font = "sans serif"
+
+[server]
+# Evita reprocessar a cada toque; o app limpa o cache sozinho ao salvar dados.
+runOnSave = false
