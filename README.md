@@ -129,8 +129,9 @@ feita na mão fica pendente — aqui o COMMIT é explícito.
 
 Esta aba **não** usa a view `vw_base_tidy`. Ela vive sobre a planilha
 `Base de dados para Dash Board.xlsx` (sell-in: pedidos faturados para as
-concessionárias, linha a linha por produto), em duas tabelas próprias
-(`vendas_verbas` e `verbas_pagamentos`) que não têm FK com o resto do banco.
+concessionárias, linha a linha por produto), em três tabelas próprias
+(`vendas_verbas`, `verbas_pagamentos` e `verbas_marketing_pagos`) que não têm FK
+com o resto do banco.
 
 São bases diferentes de propósito: o Dashboard mede o sell-out por consultor
 (passagens → refis); a aba Verbas mede a verba gerada por venda. Por isso os
@@ -142,10 +143,12 @@ lá** — a planilha de vendas não tem passagens, e não há como derivá-las.
 ```
 mysql -u root -p dashboard_dahruj < "alteracoes no sql/add_verbas.sql"
 mysql -u root -p dashboard_dahruj < "alteracoes no sql/verbas_pagamentos_inicial.sql"
+mysql -u root -p dashboard_dahruj < "alteracoes no sql/add_verbas_marketing_pagos.sql"
 ```
 
 O segundo grava o estado inicial dos pagamentos (Fev–Jul/2026 pagos). Depois
-disso quem manda é a planilha.
+disso quem manda é a planilha. O terceiro cria a tabela dos pagamentos de
+marketing (nasce vazia).
 
 ### Rotina semanal (sexta-feira)
 
@@ -168,11 +171,41 @@ Na aba **`Pagamentos`** da planilha (colunas `Mês` · `Consultor Pago` ·
 `Gerente Pago`), marque `Sim` no mês que foi pago e rode `importar_verbas.py`.
 Aquele mês sai do saldo. Sem tocar em SQL nem em código.
 
-- Marketing não tem coluna: a reserva nunca é paga a ninguém, é sempre saldo.
+- Marketing não entra nessa aba: ele tem a sua própria (veja abaixo), porque o
+  que se paga é um **valor**, não um mês inteiro.
 - Jan/2026 fica `Não`/`Não` — não se pagou verba daquelas vendas, tudo virou
   marketing, então o mês inteiro é saldo.
 - Se a aba `Pagamentos` não existir, o script preserva o que já está no banco e
   avisa — nunca zera em silêncio.
+
+### Lançar um pagamento de verba de MARKETING
+
+A reserva de marketing não é paga a ninguém: ela se acumula e é gasta em pedaços,
+em eventos. Por isso não tem "Sim/Não" — tem valor e mês.
+
+Na aba **`VERBAS DE MARKETING`** da planilha (cabeçalho na linha 1):
+
+| Mês do pgto | valor |
+|-------------|-------|
+| 01/09/2026  | 5000  |
+| 01/09/2026  | 1200  |
+| out/26      | 3000  |
+
+Rode `python importar_verbas.py` e pronto: cada valor é descontado do saldo de
+marketing **no mês do pagamento**, aparece no card "Verba já paga → Marketing" e
+nas colunas `Marketing Pago` e `Saldo Marketing` da tabela mês a mês.
+
+- **Vários pagamentos no mesmo mês**: repita o mês em linhas diferentes; o
+  importador soma (no exemplo acima, set/2026 fica com R$ 6.200,00).
+- **O mês aceita** data (`01/09/2026`), `09/2026` ou `set/26`. **O valor aceita**
+  `5000`, `5.000,00` ou `R$ 5.000,00`. Uma linha que não der para ler **para a
+  importação inteira** e aponta a linha — pagamento perdido em silêncio inflaria
+  o saldo.
+- **Saldo negativo no mês não é erro**: o gasto sai do caixa acumulado, então um
+  evento caro pode consumir o que sobrou dos meses anteriores.
+- **Apagou a linha da planilha?** O pagamento some do banco na próxima rodada e o
+  saldo volta a subir — a planilha é a fonte da verdade.
+- Se a aba não existir, o script preserva o que está no banco e avisa.
 
 ### Atualizar também o banco online
 

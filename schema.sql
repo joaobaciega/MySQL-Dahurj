@@ -18,9 +18,9 @@ USE dashboard_dahruj;
 -- A ordem de criação respeita as chaves estrangeiras.
 -- (DROPs na ordem inversa para permitir recriação limpa do esquema.)
 --
--- `vendas_verbas` e `verbas_pagamentos` (fim do arquivo) NÃO entram nos DROPs de
--- propósito: são criadas com IF NOT EXISTS e sobrevivem a uma recriação do
--- esquema. Rodar este arquivo zera os lançamentos sem derrubar a base de verbas
+-- `vendas_verbas`, `verbas_pagamentos` e `verbas_marketing_pagos` (fim do
+-- arquivo) NÃO entram nos DROPs de propósito: são criadas com IF NOT EXISTS e
+-- sobrevivem a uma recriação do esquema. Rodar este arquivo zera os lançamentos sem derrubar a base de verbas
 -- — que, de qualquer forma, se recompõe com `python importar_verbas.py`.
 DROP VIEW  IF EXISTS vw_base_tidy;
 DROP TABLE IF EXISTS lancamentos;
@@ -396,6 +396,28 @@ CREATE TABLE IF NOT EXISTS verbas_pagamentos (
   mes             DATE       NOT NULL,
   consultor_pago  TINYINT(1) NOT NULL DEFAULT 0,
   gerente_pago    TINYINT(1) NOT NULL DEFAULT 0,
+  PRIMARY KEY (mes)
+) ENGINE=InnoDB;
+
+-- -----------------------------------------------------------------------------
+-- 7) verbas_marketing_pagos  (PAGAMENTOS DA VERBA DE MARKETING)
+--    Consultor e gerente são pagos por mês inteiro, daí o SIM/NÃO da tabela 6.
+--    Marketing não: a reserva se acumula e é gasta em pedaços, em eventos. O que
+--    se guarda aqui é um VALOR por mês de pagamento, que o dashboard desconta do
+--    saldo de marketing daquele mês.
+--
+--    O valor pago pode passar a verba gerada no mês — a reserva é um caixa
+--    acumulado, então um evento caro consome o que sobrou dos meses anteriores.
+--    O saldo do mês fica negativo na tabela mês a mês e o do ano segue correto.
+--
+--    Alimentada pela aba `VERBAS DE MARKETING` do Excel (`Mês do pgto` · `valor`).
+--    Vários pagamentos no mesmo mês: repita o mês em linhas diferentes, o
+--    importador soma antes de gravar. DDL isolado em
+--    `alteracoes no sql/add_verbas_marketing_pagos.sql`.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS verbas_marketing_pagos (
+  mes    DATE          NOT NULL,
+  valor  DECIMAL(12,2) NOT NULL DEFAULT 0,
   PRIMARY KEY (mes)
 ) ENGINE=InnoDB;
 

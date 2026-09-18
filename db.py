@@ -140,6 +140,29 @@ def ler_pagamentos_verba():
 
 
 @st.cache_data(ttl=60)
+def ler_pagamentos_marketing():
+    """Verba de marketing paga por mês: {Timestamp(1º dia do mês): valor}.
+
+    Consultor e gerente são pagos por mês inteiro (daí o SIM/NÃO de
+    `verbas_pagamentos`); marketing é um caixa acumulado, gasto em pedaços — por
+    isso aqui vem VALOR, da tabela `verbas_marketing_pagos`.
+
+    Alimentada pela aba `VERBAS DE MARKETING` do Excel via `importar_verbas.py`.
+    Mês ausente = nada pago naquele mês. Devolve {} se a tabela ainda não existir,
+    para o app mostrar saldo cheio em vez de estourar erro de conexão.
+    """
+    eng = get_engine()
+    try:
+        with eng.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT mes, valor FROM verbas_marketing_pagos"
+            )).mappings().all()
+    except Exception:
+        return {}
+    return {pd.Timestamp(r["mes"]): float(r["valor"]) for r in rows}
+
+
+@st.cache_data(ttl=60)
 def ler_historico_lancamentos():
     """Trilha de TODOS os lançamentos já gravados (a página "Histórico" lê daqui).
 
@@ -148,24 +171,59 @@ def ler_historico_lancamentos():
     período. É a base das análises semanais, já que `lancamentos` só guarda o
     acumulado mais recente do mês.
 
-    Devolve DataFrame vazio se a tabela/view ainda não existir (migração
-    `add_historico_lancamentos.sql` não aplicada naquele banco): o app trata isso
-    como "histórico ainda não ativado" em vez de estourar erro.
+    NÃO engole erro: se a leitura falhar, a exceção sobe e a página mostra o
+    motivo junto com `diagnostico_historico()`. Engolir aqui era o que fazia a
+    tela dizer só "verifique a conexão" sem dizer o quê.
     """
     eng = get_engine()
-    try:
-        with eng.connect() as conn:
-            df = pd.read_sql(text("SELECT * FROM vw_lancamentos_historico"), conn)
-    except Exception:
-        return pd.DataFrame()
+    with eng.connect() as conn:
+        df = pd.read_sql(text("SELECT * FROM vw_lancamentos_historico"), conn)
     if df.empty:
         return df
     df["mes"] = pd.to_datetime(df["mes"])
     df["registrado_em"] = pd.to_datetime(df["registrado_em"])
-    # DECIMAL chega como Decimal; float evita Decimal × float nas agregações.
-    for c in ("aproveitamento", "total_geral", "total_periodo"):
-        df[c] = df[c].astype(float)
+    # DECIMAL/None chegam como object dependendo da versão do pandas e do driver.
+    # `to_numeric` converte os dois e transforma o que não der em NaN; o
+    # `astype(float)` que estava aqui quebrava conforme a versão do ambiente.
+    for c in ("n_lancamento", "passagens", "refil_diant", "refil_tras",
+              "aproveitamento", "total_geral", "passagens_periodo",
+              "refil_diant_periodo", "refil_tras_periodo", "total_periodo"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+
+def diagnostico_historico():
+    """Onde o app está conectado e o que existe lá — a tela de erro do Histórico
+    mostra isto. É o que separa "estou no banco errado" de "a migração não rodou
+    neste banco" de "a view existe mas veio diferente do esperado"."""
+    info = {}
+    try:
+        eng = get_engine()
+    except Exception as e:
+        return {"conexão": f"ERRO: {type(e).__name__}: {e}"}
+    u = eng.url
+    info["servidor"] = f"{u.host}:{u.port}"
+    info["banco"] = u.database
+    info["usuário"] = u.username
+    for rotulo, sql in (
+        ("lancamentos", "SELECT COUNT(*) FROM lancamentos"),
+        ("lancamentos_historico", "SELECT COUNT(*) FROM lancamentos_historico"),
+        ("vw_lancamentos_historico", "SELECT COUNT(*) FROM vw_lancamentos_historico"),
+    ):
+        try:
+            with eng.connect() as conn:
+                info[rotulo] = conn.execute(text(sql)).scalar()
+        except Exception as e:
+            info[rotulo] = f"ERRO: {type(e).__name__}: {str(e)[:200]}"
+    try:
+        with eng.connect() as conn:
+            cols = pd.read_sql(text("SELECT * FROM vw_lancamentos_historico LIMIT 0"), conn)
+        info["colunas da view"] = ", ".join(cols.columns)
+    except Exception as e:
+        info["colunas da view"] = f"ERRO: {type(e).__name__}: {str(e)[:200]}"
+    info["pandas"] = pd.__version__
+    return info
 
 
 def obter_lancamento(consultor_id, mes, unidade_id):

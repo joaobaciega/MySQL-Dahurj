@@ -15,6 +15,12 @@ Abas lidas da planilha:
     Pagamentos  auxiliar: quais meses já tiveram verba de consultor/gerente paga.
                 Se a aba não existir, o script preserva o que já está no banco e
                 avisa — nunca zera em silêncio.
+    VERBAS DE MARKETING
+                auxiliar: pagamentos da verba de marketing, colunas
+                `Mês do pgto` e `valor` (uma linha por pagamento; vários
+                pagamentos no mesmo mês são somados). Cada valor é descontado do
+                saldo de marketing no mês correspondente. Mesma regra da aba
+                Pagamentos: aba ausente = preserva o banco e avisa.
 
 Destinos: por padrão grava em TODAS as seções de banco encontradas no
 .streamlit/secrets.toml — `[mysql]` (local) e `[mysql_online]` (Streamlit Cloud).
@@ -22,7 +28,8 @@ Assim uma rodada só atualiza os dois ambientes. Sem secrets.toml, cai nas
 variáveis de ambiente DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME.
 
 Pré-requisito: as tabelas precisam existir — rode antes, uma única vez,
-`alteracoes no sql/add_verbas.sql` (ou o schema.sql completo).
+`alteracoes no sql/add_verbas.sql` e `alteracoes no sql/add_verbas_marketing_pagos.sql`
+(ou o schema.sql completo, que já traz as três).
 
 Uso:
     python importar_verbas.py                          # xlsx padrão, todos os destinos
@@ -32,6 +39,7 @@ Uso:
 """
 
 import argparse
+import datetime as dt
 import os
 import re
 import sys
@@ -48,6 +56,7 @@ EXCEL_PADRAO = BASE_DIR / "Base de dados para Dash Board.xlsx"
 ABA_VENDAS = "Total"
 ABA_PRODUTOS = "Verbas"
 ABA_PAGAMENTOS = "Pagamentos"
+ABA_MARKETING = "VERBAS DE MARKETING"
 
 # Colunas da aba `Total`, na ordem A..O. Q ("Total Verbas") é ignorada: é só a
 # soma das outras três e seria um número redundante para manter em sincronia.
@@ -251,6 +260,145 @@ def ler_pagamentos(path):
 
 
 # --------------------------------------------------------------------------
+# Aba `VERBAS DE MARKETING`
+# --------------------------------------------------------------------------
+# Mês em texto: a aba é preenchida à mão, então "set/26" e "Setembro 2026" são
+# tão prováveis quanto uma data de verdade.
+MESES_PT = {"JANEIRO": 1, "JAN": 1, "FEVEREIRO": 2, "FEV": 2, "MARCO": 3, "MAR": 3,
+            "ABRIL": 4, "ABR": 4, "MAIO": 5, "MAI": 5, "JUNHO": 6, "JUN": 6,
+            "JULHO": 7, "JUL": 7, "AGOSTO": 8, "AGO": 8, "SETEMBRO": 9, "SET": 9,
+            "OUTUBRO": 10, "OUT": 10, "NOVEMBRO": 11, "NOV": 11,
+            "DEZEMBRO": 12, "DEZ": 12}
+
+
+def _vazio(v):
+    return v is None or (not isinstance(v, str) and pd.isna(v)) or str(v).strip() == ""
+
+
+def _mes_pgto(v):
+    """'Mês do pgto' -> date do 1º dia do mês, ou None se não der para entender.
+
+    Aceita o que a planilha produz naturalmente: uma data de verdade (qualquer
+    dia do mês), '09/2026', '2026-09' e as formas escritas ('set/26',
+    'Setembro 2026'). Devolver None é proposital — quem chama transforma isso em
+    erro visível, porque um pagamento ignorado em silêncio inflaria o saldo.
+    """
+    if _vazio(v):
+        return None
+    if isinstance(v, (dt.datetime, dt.date, pd.Timestamp)):
+        return pd.Timestamp(v).date().replace(day=1)
+
+    txt = str(v).strip()
+    # Mês por extenso/abreviado + ano: 'set/26', 'Setembro 2026', 'set-2026'.
+    palavras = re.split(r"[^A-Za-zÀ-ÿ0-9]+", txt)
+    nome = next((p for p in palavras if _norm_texto(p) in MESES_PT), None)
+    if nome:
+        anos = [p for p in palavras if p.isdigit()]
+        if anos:
+            ano = int(anos[-1])
+            ano += 2000 if ano < 100 else 0
+            return dt.date(ano, MESES_PT[_norm_texto(nome)], 1)
+        return None
+
+    # 'MM/AAAA' e 'AAAA-MM' — sem dia, o to_datetime chutaria o dia de hoje.
+    m = re.fullmatch(r"(\d{1,2})[/\-.](\d{4})", txt)
+    if m:
+        return dt.date(int(m.group(2)), int(m.group(1)), 1)
+    m = re.fullmatch(r"(\d{4})[/\-.](\d{1,2})", txt)
+    if m:
+        return dt.date(int(m.group(1)), int(m.group(2)), 1)
+
+    # dayfirst: no Brasil 03/09/2026 é setembro, não março.
+    ts = pd.to_datetime(txt, errors="coerce", dayfirst=True)
+    return None if pd.isna(ts) else ts.date().replace(day=1)
+
+
+def _valor_brl(v):
+    """'valor' -> float, ou None se não for número.
+
+    Trata o texto que sobra quando a célula foi digitada e não formatada:
+    'R$ 1.500,00' e '1.500,00' viram 1500.0; '1500.00' continua 1500.0.
+    """
+    if _vazio(v):
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+
+    txt = re.sub(r"[^\d,.\-]", "", str(v))
+    if "," in txt:                      # vírgula decimal: o ponto é separador de milhar
+        txt = txt.replace(".", "").replace(",", ".")
+    try:
+        return float(txt)
+    except ValueError:
+        return None
+
+
+def _resolver_aba(path, desejada):
+    """Nome real da aba na planilha, comparando sem acento/caixa/espaço.
+
+    Sem isso, criar a aba como 'Verbas de Marketing' em vez de
+    'VERBAS DE MARKETING' faria o script dizer que ela não existe.
+    """
+    alvo = _norm_texto(desejada)
+    for nome in pd.ExcelFile(path).sheet_names:
+        if _norm_texto(nome) == alvo:
+            return nome
+    return None
+
+
+def ler_pagamentos_marketing(path):
+    """Verba de marketing paga por mês, da aba `VERBAS DE MARKETING`.
+
+    Devolve [{'mes': date, 'valor': float}] com UMA linha por mês — vários
+    pagamentos no mesmo mês são somados aqui, porque é assim que o dashboard os
+    exibe e a tabela tem o mês como chave.
+
+    Devolve None (não lista vazia) quando a aba não existe: quem chama precisa
+    distinguir "não informado, preserve o banco" de "informado e vazio".
+    """
+    aba = _resolver_aba(path, ABA_MARKETING)
+    if aba is None:
+        return None
+    df = pd.read_excel(path, sheet_name=aba)
+
+    # Cabeçalho tolerante: 'Mês do pgto', 'Mes do Pgto' e 'MÊS DO PGTO' são a
+    # mesma coluna; 'valor' e 'Valor' idem.
+    colunas = {_norm_texto(c): c for c in df.columns}
+    col_mes = next((v for k, v in colunas.items() if k.startswith("MES")), None)
+    col_valor = next((v for k, v in colunas.items() if k.startswith("VALOR")), None)
+    if col_mes is None or col_valor is None:
+        raise SystemExit(
+            f"A aba '{aba}' não tem as colunas esperadas (achei: {list(df.columns)}).\n"
+            "Layout esperado (cabeçalho na linha 1):\n"
+            "    Mês do pgto | valor\n"
+            "    01/09/2026  | 5000"
+        )
+
+    por_mes, problemas = {}, []
+    for i, r in df.iterrows():
+        bruto_mes, bruto_valor = r[col_mes], r[col_valor]
+        if _vazio(bruto_mes) and _vazio(bruto_valor):
+            continue                                  # linha em branco no fim da aba
+        if _norm_texto(bruto_mes) in ("TOTAL", "SOMA", "TOTALGERAL"):
+            continue                                  # rodapé de conferência, não pagamento
+        mes, valor = _mes_pgto(bruto_mes), _valor_brl(bruto_valor)
+        if mes is None or valor is None:
+            # Erro, não aviso: pagamento perdido vira saldo de marketing inflado.
+            problemas.append(f"    linha {i + 2}: mês={bruto_mes!r} valor={bruto_valor!r}")
+            continue
+        por_mes[mes] = round(por_mes.get(mes, 0.0) + valor, 2)
+
+    if problemas:
+        raise SystemExit(
+            f"A aba '{aba}' tem linha(s) que não deu para ler — corrija e rode de "
+            "novo (nada foi gravado):\n" + "\n".join(problemas) +
+            "\nO mês aceita data (01/09/2026), '09/2026' ou 'set/26'. "
+            "O valor aceita 5000, 5.000,00 ou R$ 5.000,00."
+        )
+    return [{"mes": m, "valor": v} for m, v in sorted(por_mes.items())]
+
+
+# --------------------------------------------------------------------------
 # Gravação
 # --------------------------------------------------------------------------
 CAMPOS = ["data", "pedido", "cnpj", "cliente", "codigo", "produto", "tipo_refil",
@@ -271,7 +419,12 @@ UPSERT_PAGAMENTOS = text("""
 """)
 
 
-def gravar(cfg, vendas, pagamentos):
+INSERT_MARKETING = text(
+    "INSERT INTO verbas_marketing_pagos (mes, valor) VALUES (:mes, :valor)"
+)
+
+
+def gravar(cfg, vendas, pagamentos, mkt_pagos):
     """Regrava a base de verbas num destino. Tudo numa transação só.
 
     `eng.begin()` abre transação e dá COMMIT explícito no fim — necessário porque
@@ -294,10 +447,16 @@ def gravar(cfg, vendas, pagamentos):
             conn.execute(text("DELETE FROM verbas_pagamentos"))
             if pagamentos:
                 conn.execute(UPSERT_PAGAMENTOS, pagamentos)
+        if mkt_pagos is not None:
+            # DELETE + INSERT (não UPSERT): pagamento apagado da planilha tem de
+            # sumir do banco também, senão o saldo nunca voltaria a subir.
+            conn.execute(text("DELETE FROM verbas_marketing_pagos"))
+            if mkt_pagos:
+                conn.execute(INSERT_MARKETING, mkt_pagos)
     return eng
 
 
-def conferir(eng, vendas):
+def conferir(eng, vendas, mkt_pagos):
     """Compara o que o banco somou com o que o Excel trazia. Imprime OK/DIVERGÊNCIA
     por métrica e devolve True se tudo bateu."""
     with eng.connect() as conn:
@@ -314,6 +473,16 @@ def conferir(eng, vendas):
             "SELECT COUNT(*) FROM verbas_pagamentos "
             "WHERE consultor_pago = 1 OR gerente_pago = 1"
         )).scalar()
+        try:
+            mkt = conn.execute(text(
+                "SELECT COUNT(*) AS meses, COALESCE(SUM(valor), 0) AS pago "
+                "FROM verbas_marketing_pagos"
+            )).mappings().one()
+        except Exception:
+            # Banco que ainda não recebeu `add_verbas_marketing_pagos.sql`. Sem a
+            # aba na planilha nada precisou ser gravado lá, então a importação
+            # continua válida — só a linha de marketing sai como "—".
+            mkt = None
 
     esperado = {
         "linhas": len(vendas),
@@ -322,6 +491,8 @@ def conferir(eng, vendas):
         "verba gerente": round(float(vendas["total_gerente"].sum()), 2),
         "verba marketing": round(float(vendas["total_reserva"].sum()), 2),
     }
+    if mkt_pagos is not None and mkt is not None:
+        esperado["marketing pago"] = round(sum(p["valor"] for p in mkt_pagos), 2)
     obtido = {
         "linhas": int(row["linhas"]),
         "faturamento": round(float(row["fat"]), 2),
@@ -329,6 +500,8 @@ def conferir(eng, vendas):
         "verba gerente": round(float(row["gerente"]), 2),
         "verba marketing": round(float(row["marketing"]), 2),
     }
+    if mkt_pagos is not None and mkt is not None:
+        obtido["marketing pago"] = round(float(mkt["pago"]), 2)
 
     ok = True
     for k in esperado:
@@ -342,6 +515,15 @@ def conferir(eng, vendas):
             print(molde.format(k, _brl(o), _brl(e), "OK" if bate else "DIVERGÊNCIA"))
     print(f"{'pedidos':>16}: {row['pedidos']}")
     print(f"{'meses pagos':>16}: {pagos}")
+    # O saldo é o número que a aba Verbas mostra — imprimir aqui evita ter de
+    # abrir o dashboard só para saber quanto sobrou de marketing.
+    if mkt is None:
+        print(f"{'marketing':>16}: tabela `verbas_marketing_pagos` ainda não existe "
+              "neste banco (rode 'alteracoes no sql/add_verbas_marketing_pagos.sql')")
+    else:
+        saldo_mkt = round(float(row["marketing"]) - float(mkt["pago"]), 2)
+        print(f"{'marketing':>16}: pago em {mkt['meses']} mês(es) · "
+              f"saldo {_brl(saldo_mkt)}")
     return ok
 
 
@@ -366,6 +548,7 @@ def main():
     tipos = ler_tipos_produto(caminho)
     vendas, descartadas = ler_vendas(caminho, tipos)
     pagamentos = ler_pagamentos(caminho)
+    mkt_pagos = ler_pagamentos_marketing(caminho)
 
     print(f"  {len(vendas)} vendas lidas da aba '{ABA_VENDAS}'"
           + (f" ({descartadas} linha(s) sem data ignorada(s))" if descartadas else ""))
@@ -386,17 +569,30 @@ def main():
         marcados = sum(1 for p in pagamentos if p["consultor_pago"] or p["gerente_pago"])
         print(f"  {len(pagamentos)} mês(es) na aba '{ABA_PAGAMENTOS}', {marcados} com verba paga")
 
+    if mkt_pagos is None:
+        print(f"  AVISO: aba '{ABA_MARKETING}' não encontrada — os pagamentos de "
+              "marketing no banco ficam como estão. Layout esperado:")
+        print("         Mês do pgto | valor")
+        print("         01/09/2026  | 5000")
+    else:
+        total_mkt = sum(p["valor"] for p in mkt_pagos)
+        print(f"  {len(mkt_pagos)} mês(es) com pagamento na aba '{ABA_MARKETING}', "
+              f"somando {_brl(total_mkt)}")
+
     tudo_ok = True
     for rotulo, cfg in destinos(args.destino):
         print(f"\n--- Gravando em '{rotulo}' ({cfg.get('host')}/{cfg['database']}) ---")
         try:
-            eng = gravar(cfg, vendas, pagamentos)
+            eng = gravar(cfg, vendas, pagamentos, mkt_pagos)
         except Exception as e:
             tudo_ok = False
             print(f"  FALHOU: {e}")
             print("  Nada foi alterado neste destino (a transação sofreu rollback).")
+            if "verbas_marketing_pagos" in str(e):
+                print("  A tabela de pagamentos de marketing ainda não existe neste "
+                      "banco: rode 'alteracoes no sql/add_verbas_marketing_pagos.sql'.")
             continue
-        tudo_ok = conferir(eng, vendas) and tudo_ok
+        tudo_ok = conferir(eng, vendas, mkt_pagos) and tudo_ok
 
     print("\n" + ("Importação concluída." if tudo_ok else
                   "Importação terminou COM PENDÊNCIAS — revise as mensagens acima."))
